@@ -2,7 +2,8 @@
 This is (currently) a small experimental project on
 dynamic adaptive mesh refinement (AMR) (here
 used synonymously with adaptive multiresolution)
-in JAX.
+in JAX. At some point to be brought into 
+[jf1uids](https://github.com/leo1200/jf1uids) as an option.
 
 ![AMR Example](amr.gif)
 
@@ -45,3 +46,7 @@ have to accept some memory management overhead.
 - [ ] 2D simulations
 - [ ] tests on performance
 - [ ] tests on differentiability
+
+## Alternatives to AMR
+
+- automatically adaptive particle-based methods, like SPH, see e.g. [jax-sph](https://github.com/tumaer/jax-sph)
