@@ -32,7 +32,8 @@ from neighboring cells.
   of the cells. To query neighbors by e.g. their Morton index, hash maps
   can be useful (O(1) complexity) but then we would need dynamic hash 
   maps - which is difficult (see [here](https://github.com/jax-ml/jax/discussions/10475)
-  for a discussion).
+  for a discussion) - and collisions are a problem of non-perfect hash functions, 
+  challenging the computational complexity advantage (see e.g. [here](https://arxiv.org/abs/1712.00408))
 - If we have an ordered list (or a tree structure) of the cells, we can
   perform binary search to find cells by the Morton index (O(log(n)) complexity).
 
