@@ -1,4 +1,5 @@
 # jamr
+[![DOI](https://zenodo.org/badge/883041991.svg)](https://doi.org/10.5281/zenodo.14163870)
 This is (currently) a small experimental project on
 dynamic adaptive mesh refinement (AMR) (here
 used synonymously with adaptive multiresolution)
