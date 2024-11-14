@@ -43,7 +43,7 @@ have to accept some memory management overhead.
 ## State of the Project
 
 - [x] simple 1D fluid simulations with refinement, fully jit-compiled ✅
-- [ ] derefinement
+- [x] derefinement
 - [ ] 2D simulations
 - [ ] tests on performance
 - [ ] tests on differentiability

@@ -2,8 +2,6 @@
 The goal here is to implement (dynamic) adaptive mesh refinement 
 (adaptive multiresolution), starting with 1d hydrodynamics.
 
-We currently only support refinement, no coarsening (de-refinement).
-
 """
 
 # basic fluid operations
@@ -22,7 +20,7 @@ import jax.numpy as jnp
 
 # for type annotations,
 # use e.g. beartype for checking
-from typing import Self
+from typing import Self, Tuple
 from jaxtyping import Array, Bool, Float, Int
 
 # pytree-objects via eqx.Module
@@ -150,6 +148,48 @@ def insert_into_buffer(
 
     return list1
 
+@jax.jit
+def remove_from_buffer(
+    list: Float[Array, "num_vars buffer_size"],
+    mask: Float[Array, " buffer_size"],
+) -> Float[Array, "num_vars buffer_size"]:
+    """
+    Removes the masked elements from the list, shifting values to the
+    left to fill the gaps, right-most elements that get freed up are
+    set to the same value as the former right-most element.
+
+    Args:
+        list: The list from which elements should be removed.
+        mask: A boolean mask indicating which elements should be removed.
+
+    Returns:
+        The updated list.
+    """
+
+    # let us again consider an example
+    # list = jnp.array([1, 2, 3, 4, 5, 0, 0, 0, 0, 0])
+    # mask = jnp.array([0, 1, 1, 0, 0, 0, 0, 0, 0, 0], dtype=bool)
+    # with wanted result
+    # res  = jnp.array([1, 4, 5, 0, 0, 0, 0, 0, 0, 0])
+
+    index_list = jnp.arange(mask.shape[0])
+    # ind. = jnp.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+    setter = (index_list - jnp.cumsum(mask)) * (1 - mask)
+    # set. = jnp.array([0, 0, 0, 1, 2, 3, 4, 5, 6, 7])
+
+    # construct the shifter
+    shifter = index_list.at[setter].set(index_list * (1 - mask))
+    # shi. = jnp.array([[0, 3, 4, 5, 6, 7, 8, 9, 8, 9]])
+
+    # handle the right-most elements freed up
+    max_used_index = mask.shape[0] - jnp.sum(mask)
+    max_index = mask.shape[0] - 1
+    upper_mask = (index_list < max_used_index) & (index_list < max_index)
+    shifter = jnp.where(upper_mask, shifter, max_index)
+    # shi. = jnp.array([[0, 3, 4, 5, 6, 7, 8, 9, 9, 9]])
+
+    return list[:, shifter]
 
 class _BufferedList(eqx.Module):
     buffer: Float[Array, "num_vars buffer_size"]
@@ -224,6 +264,26 @@ class _BufferedList(eqx.Module):
         num_cells = self.num_cells + jnp.sum(mask)
 
         return _BufferedList(buffer, num_cells)
+    
+    @jax.jit
+    def remove_elements(
+        self,
+        mask: Bool[Array, "buffer_size"],
+    ) -> Self:
+        """
+        Removes the masked elements from the buffer.
+
+        Args:
+            mask: The mask indicating which elements to remove.
+
+        Returns:
+            The updated buffer.
+        """
+
+        buffer = remove_from_buffer(self.buffer, mask)
+        num_cells = self.num_cells - jnp.sum(mask)
+
+        return _BufferedList(buffer, num_cells)
 
 
 # -------------------------------------------------------------
@@ -249,8 +309,11 @@ def get_refinement_mask(
     Returns a mask indicating which cells should be refined.
 
     Args:
-        fluid_data: The fluid data.
-        gamma: The adiabatic index.
+        primitive_states: The primitive states.
+        center_buffer: The cell centers.
+        refinement_levels: The refinement levels.
+        refinement_tolerance: The derefinement tolerance.
+        num_cells: The number of cells
 
     Returns:
         A mask indicating which cells should be refined.
@@ -260,16 +323,16 @@ def get_refinement_mask(
     refinement_criterion = jnp.zeros(primitive_states.shape[1], dtype=bool)
 
     # get the limited gradients
-    limited_gradients = _calculate_average_gradients(primitive_states, center_buffer)
+    average_gradients = _calculate_average_gradients(primitive_states, center_buffer)
 
     # calculate the density jump
-    density_jump = jnp.abs(limited_gradients[0])
+    density_jump = jnp.abs(average_gradients[0])
 
     # calculate the pressure jump
-    pressure_jump = jnp.abs(limited_gradients[2])
+    pressure_jump = jnp.abs(average_gradients[2])
 
     # calculate the velocity jump
-    velocity_jump = jnp.abs(limited_gradients[1])
+    velocity_jump = jnp.abs(average_gradients[1])
 
     # calculate the density jump criterion
     density_jump_criterion = density_jump > refinement_tolerance
@@ -495,6 +558,154 @@ def refine(
     return fluid_data
 
 
+def get_derefinement_masks(
+    primitive_states: Float[Array, "num_prims buffer_size"],
+    center_buffer: Float[Array, "buffer_size"],
+    refinement_levels: Float[Array, "buffer_size"],
+    derefinement_tolerance: float,
+    num_cells: int,
+) -> Tuple[Bool[Array, "buffer_size"], Bool[Array, "buffer_size"]]:
+    """
+    Masks for derefinement.
+
+    Args:
+        primitive_states: The primitive states.
+        center_buffer: The cell centers.
+        refinement_levels: The refinement levels.
+        derefinement_tolerance: The derefinement tolerance.
+        num_cells: The number of cells
+
+    Returns:
+        A tuple of a mask indicating what cells should be overwritten and 
+        one indicating what cells should be deleted
+    """
+
+    # derefinement criterion
+    derefinement_criterion = jnp.zeros(primitive_states.shape[1], dtype=bool)
+
+    # get the limited gradients
+    average_gradients = _calculate_average_gradients(primitive_states, center_buffer)
+
+    # calculate the density jump
+    density_jump = jnp.abs(average_gradients[0])
+
+    # calculate the pressure jump
+    pressure_jump = jnp.abs(average_gradients[2])
+
+    # calculate the velocity jump
+    velocity_jump = jnp.abs(average_gradients[1])
+
+    # calculate the density jump criterion
+    density_jump_criterion = density_jump < derefinement_tolerance
+
+    # calculate the pressure jump criterion
+    pressure_jump_criterion = pressure_jump < derefinement_tolerance
+
+    # calculate the velocity jump criterion
+    velocity_jump_criterion = velocity_jump < derefinement_tolerance
+
+    # calculate the refinement criterion
+    derefinement_criterion_no_pad = jnp.logical_and(
+        density_jump_criterion,
+        jnp.logical_and(pressure_jump_criterion, velocity_jump_criterion),
+    )
+
+    derefinement_criterion = derefinement_criterion.at[1:-1].set(
+        derefinement_criterion_no_pad
+    )
+
+    # ignore cells where the refinement level is already at the maximum
+    derefinement_criterion = jnp.logical_and(
+        derefinement_criterion, refinement_levels > 0
+    )
+
+    # do not refine the first and last cell
+    derefinement_criterion = derefinement_criterion.at[0].set(False)
+    mask = get_index_range_mask(primitive_states, 0, num_cells - 1)
+    derefinement_criterion = jnp.where(mask, derefinement_criterion, False)
+
+    # TODO: also balance derefinement criterion
+
+    # we can only derefine cells where the neighbor has the same refinement level
+    # and both fulfill the derefinement criterion
+    derefinement_criterion = derefinement_criterion.at[0:-1].set(derefinement_criterion[1:] & derefinement_criterion[:-1])
+    derefinement_criterion = derefinement_criterion.at[0:-1].set((refinement_levels[1:] == refinement_levels[:-1]) & derefinement_criterion[:-1])
+
+    # in the overwriting mask, we want the left neighbors, which in our sorted
+    # list will always be on even indices
+    overwriting_mask = derefinement_criterion.at[1::2].set(False)
+
+    # the deletion mask are the right neighbors, which we get by rolling the
+    # overwriting mask by one
+    deletion_mask = jnp.roll(overwriting_mask, 1)
+
+    # print(overwriting_mask)
+
+    return overwriting_mask, deletion_mask
+
+@jax.jit
+def calculate_derefined_cells(
+    fluid_data: _BufferedList,
+) -> _BufferedList:
+    """
+    Replaces the fluid quantities on every cell with the average
+    of the current cell and its right neighbor.
+
+    Args:
+        fluid_data: The fluid data.
+
+    Returns:
+        The derefined fluid data.
+    
+    """
+    buffer = fluid_data.buffer
+
+    # the primitive state and centers are set to the average
+    buffer = buffer.at[0:4, 0:-1].set((buffer[0:4, 0:-1] + buffer[0:4, 1:]) / 2)
+
+    # the volume is set to the sum
+    buffer = buffer.at[4, 0:-1].set(buffer[4, 0:-1] + buffer[4, 1:])
+
+    # the refinement levels are subtracted by one
+    buffer = buffer.at[5, 0:-1].set(buffer[5, 0:-1] - 1)
+
+    return _BufferedList(buffer, fluid_data.num_cells)
+
+@jax.jit
+def derefine(
+    fluid_data: _BufferedList, derefinement_tolerance: float
+) -> _BufferedList:
+    """
+    Apply derefinement to the fluid data until no further derefinement
+    is necessary given our derefinement criterion.
+
+    Args:
+        fluid_data: The fluid data.
+        derefinement_tolerance: The derefinement tolerance.
+
+    Returns:
+        The derefined fluid data.
+    """
+
+    # no loop because we do not want to derefine multiple levels in one
+    # timestep
+
+    overwriting_mask, deletion_mask = get_derefinement_masks(
+        fluid_data.buffer[0:3, :],
+        fluid_data.buffer[3, :],
+        fluid_data.buffer[5, :],
+        derefinement_tolerance,
+        fluid_data.num_cells,
+    )
+
+    fluid_data = fluid_data.set_elements(
+        calculate_derefined_cells(fluid_data).buffer, overwriting_mask
+    )
+
+    fluid_data = fluid_data.remove_elements(deletion_mask)
+    fluid_data = fluid_data.reset_allocatable_elements()
+    return fluid_data
+
 # -------------------------------------------------------------
 # ==================== ↑ AMR Operations ↑ =====================
 # -------------------------------------------------------------
@@ -511,6 +722,7 @@ def time_integration_fixed_stepsize(
     num_steps: int,
     maximum_refinement: int,
     refinement_tolerance: float,
+    derefinement_tolerance: float,
 ) -> _BufferedList:
     """
     A simple first order Godunov finite volume scheme for
@@ -528,6 +740,10 @@ def time_integration_fixed_stepsize(
     """
 
     def step(_: int, fluid_data: _BufferedList) -> _BufferedList:
+
+        # derefine the mesh
+        fluid_data = derefine(fluid_data, derefinement_tolerance)
+
         # refine the mesh
         fluid_data = refine(fluid_data, refinement_tolerance, maximum_refinement)
         primitive_state = fluid_data.buffer[0:3, :]
@@ -556,6 +772,7 @@ def time_integration_fixed_stepsize(
         return fluid_data
 
     fluid_data = jax.lax.fori_loop(0, num_steps, step, fluid_data)
+
 
     return fluid_data
 
@@ -591,8 +808,8 @@ def plot_density(ax, fluid_data: _BufferedList) -> None:
         0,
         1,
         color="black",
-        linestyle="dashed",
-        alpha=0.5,
+        # linestyle="dashed",
+        alpha=0.1,
     )
 
     # labeling
@@ -607,6 +824,7 @@ def animation(
     num_steps: int,
     maximum_refinement: int,
     refinement_tolerance: float,
+    derefinement_tolerance: float,
 ) -> None:
     """
     A simple animation of the fluid density.
@@ -628,11 +846,11 @@ def animation(
         ax.clear()
         nonlocal fluid_data
         fluid_data = time_integration_fixed_stepsize(
-            fluid_data, dt, 1, maximum_refinement, refinement_tolerance
+            fluid_data, dt, 1, maximum_refinement, refinement_tolerance, derefinement_tolerance
         )
         plot_density(ax, fluid_data)
 
-    ani = FuncAnimation(fig, update, frames=num_steps, repeat=False)
+    ani = FuncAnimation(fig, update, frames=num_steps, repeat=False, interval=1)
     ani.save("amr.gif")
 
 
@@ -676,8 +894,11 @@ def shock_tube_example():
         jnp.vstack([fluid_buffer, center_buffer, volume_buffer, refinement_level_buffer]), N
     )
 
+    derefinement_tolerance = 0.5
+    refinement_tolerance = 5.0
+
     # run animation
-    animation(fluid_data, 0.001, 200, 3, 0.01)
+    animation(fluid_data, 0.001, 200, 3, refinement_tolerance, derefinement_tolerance)
 
 if __name__ == "__main__":
     shock_tube_example()
